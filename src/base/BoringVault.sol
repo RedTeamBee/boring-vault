@@ -15,6 +15,10 @@ contract BoringVault is ERC20, Auth, ERC721Holder, ERC1155Holder {
     using SafeTransferLib for ERC20;
     using FixedPointMathLib for uint256;
 
+    // ========================================= ERRORS =========================================
+
+    error ArrayLengthMismatch();
+
     // ========================================= STATE =========================================
 
     /**
@@ -58,6 +62,9 @@ contract BoringVault is ERC20, Auth, ERC721Holder, ERC1155Holder {
         returns (bytes[] memory results)
     {
         uint256 targetsLength = targets.length;
+        if (targetsLength != data.length || targetsLength != values.length) {
+            revert ArrayLengthMismatch();
+        }
         results = new bytes[](targetsLength);
         for (uint256 i; i < targetsLength; ++i) {
             results[i] = targets[i].functionCallWithValue(data[i], values[i]);
@@ -77,10 +84,8 @@ contract BoringVault is ERC20, Auth, ERC721Holder, ERC1155Holder {
     {
         // Transfer assets in
         if (assetAmount > 0) asset.safeTransferFrom(from, address(this), assetAmount);
-
         // Mint shares.
         _mint(to, shareAmount);
-
         emit Enter(from, address(asset), assetAmount, to, shareAmount);
     }
 
@@ -97,14 +102,13 @@ contract BoringVault is ERC20, Auth, ERC721Holder, ERC1155Holder {
     {
         // Burn shares.
         _burn(from, shareAmount);
-
         // Transfer assets out.
         if (assetAmount > 0) asset.safeTransfer(to, assetAmount);
-
         emit Exit(to, address(asset), assetAmount, from, shareAmount);
     }
 
     //============================== BEFORE TRANSFER HOOK ===============================
+
     /**
      * @notice Sets the share locker.
      * @notice If set to zero address, the share locker logic is disabled.
