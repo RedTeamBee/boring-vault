@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity 0.8.21;
-
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {ERC721Holder} from "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 import {ERC1155Holder} from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
@@ -8,6 +7,7 @@ import {FixedPointMathLib} from "@solmate/utils/FixedPointMathLib.sol";
 import {SafeTransferLib} from "@solmate/utils/SafeTransferLib.sol";
 import {ERC20} from "@solmate/tokens/ERC20.sol";
 import {BeforeTransferHook} from "src/interfaces/BeforeTransferHook.sol";
+import {IAuditLogger} from "src/interfaces/IAuditLogger.sol";
 import {Auth, Authority} from "@solmate/auth/Auth.sol";
 
 contract BoringVault is ERC20, Auth, ERC721Holder, ERC1155Holder {
@@ -16,26 +16,28 @@ contract BoringVault is ERC20, Auth, ERC721Holder, ERC1155Holder {
     using FixedPointMathLib for uint256;
 
     // ========================================= STATE =========================================
-
     /**
      * @notice Contract responsbile for implementing `beforeTransfer`.
      */
     BeforeTransferHook public hook;
+    
+    /**
+     * @notice Contract responsible for audit logging of vault operations.
+     */
+    IAuditLogger public auditLogger;
 
     //============================== EVENTS ===============================
-
     event Enter(address indexed from, address indexed asset, uint256 amount, address indexed to, uint256 shares);
     event Exit(address indexed to, address indexed asset, uint256 amount, address indexed from, uint256 shares);
+    event AuditLoggerSet(address indexed oldLogger, address indexed newLogger);
 
     //============================== CONSTRUCTOR ===============================
-
     constructor(address _owner, string memory _name, string memory _symbol, uint8 _decimals)
         ERC20(_name, _symbol, _decimals)
         Auth(_owner, Authority(address(0)))
     {}
 
     //============================== MANAGE ===============================
-
     /**
      * @notice Allows manager to make an arbitrary function call from this contract.
      * @dev Callable by MANAGER_ROLE.
@@ -45,6 +47,12 @@ contract BoringVault is ERC20, Auth, ERC721Holder, ERC1155Holder {
         requiresAuth
         returns (bytes memory result)
     {
+        // Log the management operation if audit logger is set
+        if (address(auditLogger) != address(0)) {
+            bytes4 selector = bytes4(data[:4]);
+            auditLogger.logManagementOperation(msg.sender, target, value, selector);
+        }
+        
         result = target.functionCallWithValue(data, value);
     }
 
@@ -60,12 +68,17 @@ contract BoringVault is ERC20, Auth, ERC721Holder, ERC1155Holder {
         uint256 targetsLength = targets.length;
         results = new bytes[](targetsLength);
         for (uint256 i; i < targetsLength; ++i) {
+            // Log each management operation if audit logger is set
+            if (address(auditLogger) != address(0)) {
+                bytes4 selector = bytes4(data[i][:4]);
+                auditLogger.logManagementOperation(msg.sender, targets[i], values[i], selector);
+            }
+            
             results[i] = targets[i].functionCallWithValue(data[i], values[i]);
         }
     }
 
     //============================== ENTER ===============================
-
     /**
      * @notice Allows minter to mint shares, in exchange for assets.
      * @dev If assetAmount is zero, no assets are transferred in.
@@ -77,15 +90,18 @@ contract BoringVault is ERC20, Auth, ERC721Holder, ERC1155Holder {
     {
         // Transfer assets in
         if (assetAmount > 0) asset.safeTransferFrom(from, address(this), assetAmount);
-
         // Mint shares.
         _mint(to, shareAmount);
-
+        
+        // Log the enter operation if audit logger is set
+        if (address(auditLogger) != address(0)) {
+            auditLogger.logEnterOperation(from, address(asset), assetAmount, to, shareAmount);
+        }
+        
         emit Enter(from, address(asset), assetAmount, to, shareAmount);
     }
 
     //============================== EXIT ===============================
-
     /**
      * @notice Allows burner to burn shares, in exchange for assets.
      * @dev If assetAmount is zero, no assets are transferred out.
@@ -97,11 +113,27 @@ contract BoringVault is ERC20, Auth, ERC721Holder, ERC1155Holder {
     {
         // Burn shares.
         _burn(from, shareAmount);
-
         // Transfer assets out.
         if (assetAmount > 0) asset.safeTransfer(to, assetAmount);
-
+        
+        // Log the exit operation if audit logger is set
+        if (address(auditLogger) != address(0)) {
+            auditLogger.logExitOperation(to, address(asset), assetAmount, from, shareAmount);
+        }
+        
         emit Exit(to, address(asset), assetAmount, from, shareAmount);
+    }
+
+    //============================== AUDIT LOGGER ===============================
+    /**
+     * @notice Sets the audit logger contract.
+     * @notice If set to zero address, audit logging is disabled.
+     * @dev Callable by OWNER_ROLE.
+     */
+    function setAuditLogger(address _auditLogger) external requiresAuth {
+        address oldLogger = address(auditLogger);
+        auditLogger = IAuditLogger(_auditLogger);
+        emit AuditLoggerSet(oldLogger, _auditLogger);
     }
 
     //============================== BEFORE TRANSFER HOOK ===============================
@@ -132,6 +164,5 @@ contract BoringVault is ERC20, Auth, ERC721Holder, ERC1155Holder {
     }
 
     //============================== RECEIVE ===============================
-
     receive() external payable {}
 }
