@@ -50,18 +50,42 @@ contract ManagerWithMerkleVerification is Auth, IPausable {
 
     //============================== ERRORS ===============================
 
-    error ManagerWithMerkleVerification__InvalidManageProofLength();
-    error ManagerWithMerkleVerification__InvalidTargetDataLength();
-    error ManagerWithMerkleVerification__InvalidValuesLength();
-    error ManagerWithMerkleVerification__InvalidDecodersAndSanitizersLength();
-    error ManagerWithMerkleVerification__FlashLoanNotExecuted();
-    error ManagerWithMerkleVerification__FlashLoanNotInProgress();
-    error ManagerWithMerkleVerification__BadFlashLoanIntentHash();
-    error ManagerWithMerkleVerification__FailedToVerifyManageProof(address target, bytes targetData, uint256 value);
-    error ManagerWithMerkleVerification__Paused();
-    error ManagerWithMerkleVerification__OnlyCallableByBoringVault();
-    error ManagerWithMerkleVerification__OnlyCallableByBalancerVault();
-    error ManagerWithMerkleVerification__TotalSupplyMustRemainConstantDuringPlatform();
+    error ManagerWithMerkleVerification__InvalidManageProofLength(
+        uint256 expected, uint256 actual, string message
+    );
+    error ManagerWithMerkleVerification__InvalidTargetDataLength(
+        uint256 expected, uint256 actual, string message
+    );
+    error ManagerWithMerkleVerification__InvalidValuesLength(
+        uint256 expected, uint256 actual, string message
+    );
+    error ManagerWithMerkleVerification__InvalidDecodersAndSanitizersLength(
+        uint256 expected, uint256 actual, string message
+    );
+    error ManagerWithMerkleVerification__FlashLoanNotExecuted(
+        string message
+    );
+    error ManagerWithMerkleVerification__FlashLoanNotInProgress(
+        string message
+    );
+    error ManagerWithMerkleVerification__BadFlashLoanIntentHash(
+        bytes32 expected, bytes32 actual, string message
+    );
+    error ManagerWithMerkleVerification__FailedToVerifyManageProof(
+        address target, bytes targetData, uint256 value, string message
+    );
+    error ManagerWithMerkleVerification__Paused(
+        string message
+    );
+    error ManagerWithMerkleVerification__OnlyCallableByBoringVault(
+        address caller, string message
+    );
+    error ManagerWithMerkleVerification__OnlyCallableByBalancerVault(
+        address caller, string message
+    );
+    error ManagerWithMerkleVerification__TotalSupplyMustRemainConstantDuringPlatform(
+        uint256 before, uint256 after, string message
+    );
 
     //============================== EVENTS ===============================
 
@@ -133,13 +157,27 @@ contract ManagerWithMerkleVerification is Auth, IPausable {
         bytes[] calldata targetData,
         uint256[] calldata values
     ) external requiresAuth {
-        if (isPaused) revert ManagerWithMerkleVerification__Paused();
+        if (isPaused) revert ManagerWithMerkleVerification__Paused("Contract is paused, cannot execute strategies");
         uint256 targetsLength = targets.length;
-        if (targetsLength != manageProofs.length) revert ManagerWithMerkleVerification__InvalidManageProofLength();
-        if (targetsLength != targetData.length) revert ManagerWithMerkleVerification__InvalidTargetDataLength();
-        if (targetsLength != values.length) revert ManagerWithMerkleVerification__InvalidValuesLength();
+        if (targetsLength != manageProofs.length) {
+            revert ManagerWithMerkleVerification__InvalidManageProofLength(
+                targetsLength, manageProofs.length, "Manage proofs length must match targets length"
+            );
+        }
+        if (targetsLength != targetData.length) {
+            revert ManagerWithMerkleVerification__InvalidTargetDataLength(
+                targetsLength, targetData.length, "Target data length must match targets length"
+            );
+        }
+        if (targetsLength != values.length) {
+            revert ManagerWithMerkleVerification__InvalidValuesLength(
+                targetsLength, values.length, "Values length must match targets length"
+            );
+        }
         if (targetsLength != decodersAndSanitizers.length) {
-            revert ManagerWithMerkleVerification__InvalidDecodersAndSanitizersLength();
+            revert ManagerWithMerkleVerification__InvalidDecodersAndSanitizersLength(
+                targetsLength, decodersAndSanitizers.length, "Decoders and sanitizers length must match targets length"
+            );
         }
 
         bytes32 strategistManageRoot = manageRoot[msg.sender];
@@ -152,7 +190,9 @@ contract ManagerWithMerkleVerification is Auth, IPausable {
             vault.manage(targets[i], targetData[i], values[i]);
         }
         if (totalSupply != vault.totalSupply()) {
-            revert ManagerWithMerkleVerification__TotalSupplyMustRemainConstantDuringPlatform();
+            revert ManagerWithMerkleVerification__TotalSupplyMustRemainConstantDuringPlatform(
+                totalSupply, vault.totalSupply(), "Total supply must remain constant during strategy execution"
+            );
         }
         emit BoringVaultManaged(targetsLength);
     }
@@ -171,7 +211,11 @@ contract ManagerWithMerkleVerification is Auth, IPausable {
         uint256[] calldata amounts,
         bytes calldata userData
     ) external {
-        if (msg.sender != address(vault)) revert ManagerWithMerkleVerification__OnlyCallableByBoringVault();
+        if (msg.sender != address(vault)) {
+            revert ManagerWithMerkleVerification__OnlyCallableByBoringVault(
+                msg.sender, "Flash loan can only be initiated by the BoringVault"
+            );
+        }
 
         flashLoanIntentHash = keccak256(userData);
         performingFlashLoan = true;
@@ -192,7 +236,11 @@ contract ManagerWithMerkleVerification is Auth, IPausable {
         uint256[] calldata feeAmounts,
         bytes calldata userData
     ) external {
-        if (msg.sender != address(balancerVault)) revert ManagerWithMerkleVerification__OnlyCallableByBalancerVault();
+        if (msg.sender != address(balancerVault)) {
+            revert ManagerWithMerkleVerification__OnlyCallableByBalancerVault(
+                msg.sender, "Flash loan callback can only be called by BalancerVault"
+            );
+        }
         if (!performingFlashLoan) revert ManagerWithMerkleVerification__FlashLoanNotInProgress();
 
         // Validate userData using intentHash.

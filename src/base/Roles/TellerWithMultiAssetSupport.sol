@@ -94,7 +94,7 @@ contract TellerWithMultiAssetSupport is Auth, BeforeTransferHook, ReentrancyGuar
     mapping(address => bool) public toDenyList;
 
     /**
-     * @notice Mapping `opeartor` address to a bool to deny them from calling `transfer` or `transferFrom`.
+     * @notice Mapping `operator` address to a bool to deny them from calling `transfer` or `transferFrom`.
      */
     mapping(address => bool) public operatorDenyList;
 
