@@ -11,8 +11,9 @@ import {BalancerVault} from "src/interfaces/BalancerVault.sol";
 import {Auth, Authority} from "@solmate/auth/Auth.sol";
 import {IPausable} from "src/interfaces/IPausable.sol";
 import {DroneLib} from "src/base/Drones/DroneLib.sol";
+import {ReentrancyGuard} from "@solmate/utils/ReentrancyGuard.sol";
 
-contract ManagerWithMerkleVerification is Auth, IPausable {
+contract ManagerWithMerkleVerification is Auth, IPausable, ReentrancyGuard {
     using FixedPointMathLib for uint256;
     using SafeTransferLib for ERC20;
     using Address for address;
@@ -191,7 +192,7 @@ contract ManagerWithMerkleVerification is Auth, IPausable {
         uint256[] calldata amounts,
         uint256[] calldata feeAmounts,
         bytes calldata userData
-    ) external {
+    ) external nonReentrant {
         if (msg.sender != address(balancerVault)) revert ManagerWithMerkleVerification__OnlyCallableByBalancerVault();
         if (!performingFlashLoan) revert ManagerWithMerkleVerification__FlashLoanNotInProgress();
 
