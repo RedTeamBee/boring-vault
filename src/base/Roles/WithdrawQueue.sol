@@ -13,9 +13,9 @@ import {ReentrancyGuard} from "@solmate/utils/ReentrancyGuard.sol";
 import {IPausable} from "src/interfaces/IPausable.sol";
 
 // TODO more gas efficient bulk functions.
-// TODO mulitcall
+// TODO multicall
 
-// TODO if user opts out of auto claiming, then the spread should be ised to offset the withdraw fee.
+// TODO if user opts out of auto claiming, then the spread should be used to offset the withdraw fee.
 // otherwise spread goes to solver who auto claims for user.
 contract WithdrawQueue is Auth, ReentrancyGuard, IPausable {
     using SafeTransferLib for BoringVault;
@@ -49,6 +49,7 @@ contract WithdrawQueue is Auth, ReentrancyGuard, IPausable {
      * @param maturity The time at which the withdrawal can be completed.
      * @param shares The number of shares that are requested to be withdrawn.
      * @param exchangeRateAtTimeOfRequest The exchange rate at the time of the request.
+     * @param nonce The nonce of the withdrawal request.
      */
     struct WithdrawRequest {
         bool allowThirdPartyToComplete;
@@ -56,6 +57,7 @@ contract WithdrawQueue is Auth, ReentrancyGuard, IPausable {
         uint40 maturity;
         uint96 shares;
         uint96 exchangeRateAtTimeOfRequest;
+        uint256 nonce;
     }
 
     // ========================================= CONSTANTS =========================================
@@ -103,7 +105,10 @@ contract WithdrawQueue is Auth, ReentrancyGuard, IPausable {
      */
     mapping(address => mapping(ERC20 => WithdrawRequest)) public withdrawRequests;
 
-    uint256 public withdrawNonce; // TODO implement
+    /**
+     * @notice The current withdrawal nonce, incremented for each withdrawal request.
+     */
+    uint256 public withdrawNonce;
 
     //============================== ERRORS ===============================
 
@@ -122,8 +127,7 @@ contract WithdrawQueue is Auth, ReentrancyGuard, IPausable {
     error WithdrawQueue__CannotWithdrawBoringToken();
 
     //============================== EVENTS ===============================
-    // TODO add nonce
-    event WithdrawRequested(address indexed account, ERC20 indexed asset, uint96 shares, uint40 maturity);
+    event WithdrawRequested(uint256 indexed nonce, address indexed account, ERC20 indexed asset, uint96 shares, uint40 maturity);
     event WithdrawCancelled(address indexed account, ERC20 indexed asset, uint96 shares);
     event WithdrawCompleted(address indexed account, ERC20 indexed asset, uint256 shares, uint256 assets);
     event FeeAddressSet(address newFeeAddress);
@@ -358,7 +362,52 @@ contract WithdrawQueue is Auth, ReentrancyGuard, IPausable {
         emit ThirdPartyCompletionChanged(msg.sender, asset, allow);
     }
 
-    // TODO permit method?
+    /**
+     * @notice Requests a withdrawal of shares for a specific asset using permit.
+     * @dev Allows users to approve and request withdrawal in a single transaction.
+     */
+    function requestWithdrawWithPermit(
+        ERC20 asset,
+        uint96 shares,
+        uint16 maxLoss,
+        bool allowThirdPartyToComplete,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external requiresAuth nonReentrant {
+        if (isPaused) revert WithdrawQueue__Paused();
+        WithdrawAsset storage withdrawAsset = withdrawAssets[asset];
+        if (!withdrawAsset.allowWithdraws) revert WithdrawQueue__WithdrawsNotAllowed();
+        if (maxLoss > MAX_LOSS) revert WithdrawQueue__MaxLossTooLarge();
+
+        // Handle permit
+        try asset.permit(msg.sender, address(this), shares, deadline, v, r, s) {}
+        catch {
+            // If permit fails, check if allowance is sufficient
+            if (asset.allowance(msg.sender, address(this)) < shares) {
+                revert WithdrawQueue__NoSharesToWithdraw();
+            }
+        }
+
+        boringVault.safeTransferFrom(msg.sender, address(this), shares);
+
+        withdrawAsset.outstandingShares += shares;
+
+        WithdrawRequest storage req = withdrawRequests[msg.sender][asset];
+
+        req.shares += shares;
+        uint40 maturity = uint40(block.timestamp + withdrawAsset.withdrawDelay);
+        req.maturity = maturity;
+        req.exchangeRateAtTimeOfRequest = uint96(accountant.getRateInQuoteSafe(asset));
+        req.maxLoss = maxLoss;
+        req.allowThirdPartyToComplete = allowThirdPartyToComplete;
+
+        uint256 currentNonce = withdrawNonce++;
+        req.nonce = currentNonce;
+        emit WithdrawRequested(currentNonce, msg.sender, asset, shares, maturity);
+    }
+
     /**
      * @notice Requests a withdrawal of shares for a specific asset.
      * @dev Publicly callable.
@@ -386,7 +435,9 @@ contract WithdrawQueue is Auth, ReentrancyGuard, IPausable {
         req.maxLoss = maxLoss;
         req.allowThirdPartyToComplete = allowThirdPartyToComplete;
 
-        emit WithdrawRequested(msg.sender, asset, shares, maturity);
+        uint256 currentNonce = withdrawNonce++;
+        req.nonce = currentNonce;
+        emit WithdrawRequested(currentNonce, msg.sender, asset, shares, maturity);
     }
 
     /**
@@ -551,5 +602,119 @@ contract WithdrawQueue is Auth, ReentrancyGuard, IPausable {
         }
 
         emit WithdrawCompleted(account, asset, shares, assetsToUser);
+    }
+
+    /**
+     * @notice Completes multiple withdrawal requests in a single transaction for gas efficiency.
+     * @dev Only callable by authorized solvers.
+     * @param accounts Array of accounts to complete withdrawals for.
+     * @param assets Array of assets corresponding to each account.
+     * @return totalAssetsOut Total assets distributed across all withdrawals.
+     */
+    function bulkCompleteWithdraws(address[] calldata accounts, ERC20[] calldata assets)
+        external
+        requiresAuth
+        nonReentrant
+        returns (uint256 totalAssetsOut)
+    {
+        if (isPaused) revert WithdrawQueue__Paused();
+        if (accounts.length != assets.length) revert WithdrawQueue__BadAddress();
+
+        uint256 length = accounts.length;
+        for (uint256 i; i < length; ++i) {
+            totalAssetsOut += _completeWithdrawInternal(accounts[i], assets[i]);
+        }
+    }
+
+    /**
+     * @notice Internal function to complete a single withdrawal.
+     * @dev This function contains the core withdrawal logic to avoid code duplication.
+     */
+    function _completeWithdrawInternal(address account, ERC20 asset)
+        internal
+        returns (uint256 assetsOut)
+    {
+        WithdrawRequest storage req = withdrawRequests[account][asset];
+        if (req.shares == 0) revert WithdrawQueue__NoSharesToWithdraw();
+
+        WithdrawAsset storage withdrawAsset = withdrawAssets[asset];
+        if (block.timestamp < req.maturity) revert WithdrawQueue__WithdrawNotMatured();
+
+        if (block.timestamp > req.maturity + withdrawAsset.completionWindow) {
+            revert WithdrawQueue__RequestPastCompletionWindow();
+        }
+
+        uint96 shares = req.shares;
+        uint256 currentExchangeRate = accountant.getRateInQuoteSafe(asset);
+        uint256 assetsAtTimeOfRequest = shares.mulDivDown(req.exchangeRateAtTimeOfRequest, ONE_SHARE);
+        uint256 assetsAtCurrentRate = shares.mulDivDown(currentExchangeRate, ONE_SHARE);
+
+        uint256 maxLoss = req.maxLoss == 0 ? withdrawAsset.maxLoss : req.maxLoss;
+        uint256 maxLossAmount = assetsAtTimeOfRequest.mulDivDown(maxLoss, 1e4);
+
+        if (assetsAtTimeOfRequest - assetsAtCurrentRate > maxLossAmount) {
+            revert WithdrawQueue__MaxLossExceeded();
+        }
+
+        uint256 totalAssets = withdrawAsset.outstandingShares.mulDivDown(currentExchangeRate, ONE_SHARE);
+        uint256 withdrawFee = totalAssets.mulDivDown(withdrawAsset.withdrawFee, 1e4);
+        uint256 assetsToUser = assetsAtCurrentRate - withdrawFee;
+
+        withdrawAsset.outstandingShares -= shares;
+        delete withdrawRequests[account][asset];
+
+        if (pullFundsFromVault) {
+            boringVault.exit(address(this), asset, totalAssets, address(this), shares);
+        } else {
+            boringVault.exit(address(this), asset, 0, address(this), shares);
+        }
+
+        asset.safeTransfer(account, assetsToUser);
+
+        if (totalAssets > assetsToUser) {
+            asset.safeTransfer(feeAddress, totalAssets - assetsToUser);
+        }
+
+        emit WithdrawCompleted(account, asset, shares, assetsToUser);
+        return assetsToUser;
+    }
+
+    // ========================================= VIEW FUNCTIONS =========================================
+
+    /**
+     * @notice Get the current withdrawal nonce.
+     * @return The current withdrawal nonce.
+     */
+    function getCurrentWithdrawNonce() external view returns (uint256) {
+        return withdrawNonce;
+    }
+
+    /**
+     * @notice Check if a user's withdrawal request has exceeded max loss.
+     * @param account The account to check.
+     * @param asset The asset to check.
+     * @return hasExceededMaxLoss True if max loss has been exceeded.
+     * @return currentLoss The current loss percentage (in basis points).
+     */
+    function checkMaxLossExceeded(address account, ERC20 asset)
+        external
+        view
+        returns (bool hasExceededMaxLoss, uint256 currentLoss)
+    {
+        WithdrawRequest memory req = withdrawRequests[account][asset];
+        if (req.shares == 0) return (false, 0);
+
+        WithdrawAsset memory withdrawAsset = withdrawAssets[asset];
+        uint256 currentExchangeRate = accountant.getRateInQuoteSafe(asset);
+        uint256 assetsAtTimeOfRequest = req.shares.mulDivDown(req.exchangeRateAtTimeOfRequest, ONE_SHARE);
+        uint256 assetsAtCurrentRate = req.shares.mulDivDown(currentExchangeRate, ONE_SHARE);
+
+        uint256 maxLoss = req.maxLoss == 0 ? withdrawAsset.maxLoss : req.maxLoss;
+        uint256 actualLoss = assetsAtTimeOfRequest > assetsAtCurrentRate 
+            ? assetsAtTimeOfRequest - assetsAtCurrentRate 
+            : 0;
+        
+        currentLoss = actualLoss.mulDivDown(1e4, assetsAtTimeOfRequest);
+        hasExceededMaxLoss = currentLoss > maxLoss;
     }
 }
